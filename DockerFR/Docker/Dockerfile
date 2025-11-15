@@ -5,8 +5,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# OpenCV 필요한 시스템 라이브러리 설치
+# 빌드 도구 및 OpenCV 라이브러리 설치
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    g++ \
+    cmake \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*

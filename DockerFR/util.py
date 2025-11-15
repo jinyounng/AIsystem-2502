@@ -1,38 +1,22 @@
 """
-Utility implementations for the face recognition project.
-
-The code below stitches together a lightweight, classical computer vision
-pipeline so the `/face-similarity` endpoint can operate without heavyweight
-deep-learning dependencies. It is intentionally simple yet deterministic,
-giving students a reference implementation they can extend with stronger
-models later on.
+Utility implementations for the face recognition project using InsightFace/RetinaFace.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, List, Tuple, Dict
 
 import cv2
 import numpy as np
+from insightface.app import FaceAnalysis
 
 LOGGER = logging.getLogger(__name__)
 
-# Reference five-point template (RetinaFace/ArcFace) for 112x112 crops.
-RETINA_TEMPLATE: np.ndarray = np.array(
-    [
-        [38.2946, 51.6963],
-        [73.5318, 51.5014],
-        [56.0252, 71.7366],
-        [41.5493, 92.3655],
-        [70.7299, 92.2041],
-    ],
-    dtype=np.float32,
-)
-
-CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-FACE_DETECTOR = cv2.CascadeClassifier(CASCADE_PATH)
+# Initialize InsightFace app with RetinaFace detector and ArcFace recognizer
+face_app = FaceAnalysis(providers=['CPUExecutionProvider'])
+face_app.prepare(ctx_id=0, det_size=(640, 640))
 
 
 @dataclass
@@ -40,6 +24,8 @@ class DetectedFace:
     bbox: Tuple[int, int, int, int]
     face: np.ndarray
     confidence: float
+    keypoints: np.ndarray
+    embedding: np.ndarray
 
 
 def _decode_image(image: Any) -> np.ndarray:
@@ -59,82 +45,70 @@ def _decode_image(image: Any) -> np.ndarray:
 
 def detect_faces(image: Any) -> List[DetectedFace]:
     """
-    Detect faces within the provided image using a Haar cascade detector.
+    Detect faces using InsightFace RetinaFace detector.
+    Returns faces with bounding boxes, keypoints, and embeddings.
     """
     frame = _decode_image(image)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = FACE_DETECTOR.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(60, 60),
-    )
+    faces = face_app.get(frame)
+    
+    if not faces:
+        return []
+    
     detections: List[DetectedFace] = []
-    frame_area = float(frame.shape[0] * frame.shape[1])
-    for (x, y, w, h) in faces:
-        crop = frame[y : y + h, x : x + w]
-        confidence = (w * h) / frame_area
+    for face in faces:
+        bbox = face.bbox.astype(int)
+        x1, y1, x2, y2 = bbox
+        w, h = x2 - x1, y2 - y1
+        
+        crop = frame[y1:y2, x1:x2]
+        confidence = float(face.det_score)
+        keypoints = face.kps  # 5 keypoints
+        embedding = face.normed_embedding  # 512-dim ArcFace embedding
+        
         detections.append(
             DetectedFace(
-                bbox=(int(x), int(y), int(w), int(h)),
+                bbox=(x1, y1, w, h),
                 face=crop,
                 confidence=confidence,
+                keypoints=keypoints,
+                embedding=embedding,
             )
         )
+    
+    # Sort by confidence
     detections.sort(key=lambda det: det.confidence, reverse=True)
     return detections
 
 
 def compute_face_embedding(face_image: Any) -> np.ndarray:
     """
-    Compute an embedding by running a Discrete Cosine Transform over
-    a normalized grayscale crop and returning the first 512 coefficients.
+    Compute face embedding using ArcFace model from InsightFace.
+    Returns a 512-dimensional normalized embedding.
     """
-    face = _decode_image(face_image)
-    resized = cv2.resize(face, (112, 112), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-    dct = cv2.dct(gray)
-    embedding = dct.flatten()[:512]
-    if embedding.size < 512:
-        embedding = np.pad(embedding, (0, 512 - embedding.size))
-    embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
-    return embedding.astype(np.float32)
+    frame = _decode_image(face_image)
+    faces = face_app.get(frame)
+    
+    if not faces:
+        raise ValueError("No face detected in the image")
+    
+    # Return the embedding of the most confident face
+    return faces[0].normed_embedding
 
 
 def detect_face_keypoints(face_image: Any) -> np.ndarray:
     """
-    Produce five pseudo-landmarks positioned relative to the crop.
-
-    This heuristic approximation supplies enough structure for alignment when
-    no full landmark detector is available.
+    Detect 5 facial keypoints (landmarks) using RetinaFace.
+    Returns: (5, 2) array of [x, y] coordinates for:
+    - Left eye, Right eye, Nose tip, Left mouth corner, Right mouth corner
     """
-    face = _decode_image(face_image)
-    height, width = face.shape[:2]
-    keypoints = np.array(
-        [
-            [0.3 * width, 0.35 * height],
-            [0.7 * width, 0.35 * height],
-            [0.5 * width, 0.52 * height],
-            [0.32 * width, 0.75 * height],
-            [0.68 * width, 0.75 * height],
-        ],
-        dtype=np.float32,
-    )
-    return keypoints
-
-
-def _estimate_alignment_matrix(keypoints: np.ndarray) -> np.ndarray:
-    """
-    Estimate an affine transform that maps the detected keypoints to the
-    RetinaFace template.
-    """
-    if keypoints.shape != (5, 2):
-        raise ValueError("Expected five (x, y) keypoints for alignment.")
-    matrix, _ = cv2.estimateAffinePartial2D(keypoints, RETINA_TEMPLATE, method=cv2.LMEDS)
-    if matrix is None:
-        LOGGER.warning("Failed to estimate alignment matrix, using identity transform.")
-        matrix = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
-    return matrix.astype(np.float32)
+    frame = _decode_image(face_image)
+    faces = face_app.get(frame)
+    
+    if not faces:
+        raise ValueError("No face detected in the image")
+    
+    # Return keypoints of the most confident face
+    return faces[0].kps
 
 
 def warp_face(image: Any, homography_matrix: Any) -> np.ndarray:
@@ -143,6 +117,7 @@ def warp_face(image: Any, homography_matrix: Any) -> np.ndarray:
     """
     face = _decode_image(image)
     matrix = np.asarray(homography_matrix, dtype=np.float32)
+    
     if matrix.shape == (2, 3):
         return cv2.warpAffine(face, matrix, (112, 112))
     if matrix.shape == (3, 3):
@@ -152,9 +127,8 @@ def warp_face(image: Any, homography_matrix: Any) -> np.ndarray:
 
 def antispoof_check(face_image: Any) -> float:
     """
-    Perform a simple spoofing heuristic based on image sharpness. Blurry,
-    low-texture faces generally receive a lower score than crisp, detailed
-    real captures.
+    Simple anti-spoofing check based on image sharpness.
+    Note: For production, use a dedicated anti-spoofing model.
     """
     face = _decode_image(face_image)
     gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
@@ -165,45 +139,52 @@ def antispoof_check(face_image: Any) -> float:
 
 def _prepare_embedding(image_data: Any) -> Tuple[np.ndarray, float, Dict[str, Any]]:
     """
-    Helper that decodes the bytes, extracts the most confident face, aligns it,
-    and returns the embedding along with useful diagnostics.
+    Helper that extracts face, computes embedding, and returns diagnostics.
     """
-    frame = _decode_image(image_data)
-    detections = detect_faces(frame)
+    detections = detect_faces(image_data)
+    
     if not detections:
         raise ValueError("No face detected in the provided image.")
+    
     primary = detections[0]
-    keypoints = detect_face_keypoints(primary.face)
-    matrix = _estimate_alignment_matrix(keypoints)
-    aligned = warp_face(primary.face, matrix)
-    spoof_score = antispoof_check(aligned)
-    embedding = compute_face_embedding(aligned)
+    spoof_score = antispoof_check(primary.face)
+    
     debug_info = {
         "bbox": primary.bbox,
         "confidence": primary.confidence,
         "spoof_score": spoof_score,
+        "num_faces": len(detections),
     }
-    return embedding, spoof_score, debug_info
+    
+    return primary.embedding, spoof_score, debug_info
 
 
 def calculate_face_similarity(image_a: Any, image_b: Any) -> float:
     """
-    End-to-end pipeline that returns a similarity score between two faces by
-    running detection -> alignment -> anti-spoofing -> embeddings and finally
-    cosine similarity between the vectors.
+    End-to-end pipeline that returns similarity score between two faces.
+    Uses RetinaFace for detection and ArcFace for embeddings.
     """
     emb_a, spoof_a, debug_a = _prepare_embedding(image_a)
     emb_b, spoof_b, debug_b = _prepare_embedding(image_b)
-
+    
     if min(spoof_a, spoof_b) < 0.2:
         LOGGER.warning(
-            "Potential spoof detected: scores %.3f / %.3f, boxes %s / %s",
+            "Potential spoof detected: scores %.3f / %.3f",
             spoof_a,
             spoof_b,
-            debug_a["bbox"],
-            debug_b["bbox"],
         )
-
-    similarity = float(np.dot(emb_a, emb_b) / ((np.linalg.norm(emb_a) + 1e-8) * (np.linalg.norm(emb_b) + 1e-8)))
+    
+    # Cosine similarity (embeddings are already normalized)
+    similarity = float(np.dot(emb_a, emb_b))
     similarity = max(-1.0, min(1.0, similarity))
+    
+    LOGGER.info(
+        "Similarity: %.4f | Face A: %d faces (conf=%.3f) | Face B: %d faces (conf=%.3f)",
+        similarity,
+        debug_a["num_faces"],
+        debug_a["confidence"],
+        debug_b["num_faces"],
+        debug_b["confidence"],
+    )
+    
     return similarity
